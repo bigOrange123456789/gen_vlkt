@@ -19,6 +19,10 @@ from .hico_text_label import hico_text_label, hico_unseen_index
 
 
 class HICODetection(torch.utils.data.Dataset):
+    def take_the_first(self, len):
+        self.annotations = self.annotations[:len]
+        self.ids = self.ids[:len]
+
     def __init__(self, img_set, img_folder, anno_file, clip_feats_folder, transforms, num_queries, args):
         self.img_set = img_set
         self.img_folder = img_folder
@@ -280,4 +284,7 @@ def build(image_set, args):
     if image_set == 'val':
         dataset.set_rare_hois(PATHS['train'][1])
         dataset.load_correct_mat(CORRECT_MAT_PATH)
+    
+    dataset.take_the_first(10)
+
     return dataset

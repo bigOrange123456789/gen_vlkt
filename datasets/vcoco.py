@@ -13,6 +13,9 @@ from .vcoco_text_label import *
 
 
 class VCOCO(torch.utils.data.Dataset):
+    def take_the_first(self, len):
+        self.annotations = self.annotations[:len]
+        # self.ids = self.ids[:len]
 
     def __init__(self, img_set, img_folder, anno_file, transforms, num_queries, args):
         self.img_set = img_set
@@ -213,4 +216,6 @@ def build(image_set, args):
                     num_queries=args.num_queries, args=args)
     if image_set == 'val':
         dataset.load_correct_mat(CORRECT_MAT_PATH)
+
+    dataset.take_the_first(10)
     return dataset

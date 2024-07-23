@@ -2,6 +2,7 @@
 
 /params/
 
+# 忽略 
 /exps/
 
 /__pycache__/

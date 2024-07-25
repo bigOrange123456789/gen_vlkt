@@ -11,15 +11,24 @@ class GEN(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
                  num_dec_layers=3, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False,
-                 return_intermediate_dec=False):
+                 return_intermediate_dec=False): # 256 8 6 3 2048 0.1 relu False True # 参数解释：
+        # d_model=256 模型的嵌入维度
+        # nhead  =8   多头注意力机制 
+        # num_encoder_layers=6 编码器的层数
+        # num_dec_layers=3 ？
+        # dim_feedforward=2048 # FFNN中间层的输出维度(FFNN又名MLP)
+        # dropout=0.1
+        # activation=relu 
+        # normalize_before=False 使用归一化在最后的transformer层
+        # return_intermediate_dec=True 返回中间层的输出
         super().__init__()
 
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward, # 编码层 = 自注意力+前馈+残差
                                                 dropout, activation, normalize_before)
-        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
+        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None # 不归一化
+        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm) # 叠加了多层
 
-        instance_decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
+        instance_decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward, # 实例解码层 
                                                          dropout, activation, normalize_before)
         instance_decoder_norm = nn.LayerNorm(d_model)
         self.instance_decoder = TransformerDecoder(instance_decoder_layer,
@@ -27,7 +36,7 @@ class GEN(nn.Module):
                                                    instance_decoder_norm,
                                                    return_intermediate=return_intermediate_dec)
 
-        interaction_decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
+        interaction_decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward, # 交互解码层
                                                             dropout, activation, normalize_before)
         interaction_decoder_norm = nn.LayerNorm(d_model)
         self.interaction_decoder = TransformerDecoder(interaction_decoder_layer,
@@ -43,7 +52,7 @@ class GEN(nn.Module):
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+                nn.init.xavier_uniform_(p) # 通过均匀分布U(a,b)初始化参数，默认a=0,b=1
 
     def forward(self, src, mask, query_embed_h, query_embed_o, pos_guided_embed, pos_embed):
         # flatten NxCxHxW to HWxNxC
@@ -154,19 +163,39 @@ class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False):
         super().__init__()
+        # 自注意力
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        # Implementation of Feedforward model
+        # embed_dim =256：模型的嵌入维度。
+        # num_heads =8  ：并行关注头的数量。请注意，embed_dim将在num_heads之间拆分（即每个head都有维度embed_dim//num_heads）。
+        # dropout   =0.1：attn_output_weights上的Dropout概率。默认值：0.0。
+
+        # Implementation of Feedforward model 前馈模型的实现
         self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # y=x*A'+b
+        # 输入维度d_model=256 输出维度dim_feedforward=2048
         self.dropout = nn.Dropout(dropout)
+        # dropout=0.1
+        # 在训练过程中，以概率随机将输入张量的某些元素归零。
+        # p为每个前向调用独立选择归零元素，并从伯努利分布中采样。
+        # 每个通道将在每次转发呼叫时独立归零。
+        # 这已被证明是正则化的有效技术，并且 防止神经元的共适应，如论文《Improving neural networks by preventing co-adaptation of feature detectors》中所述 探测器 .
+        # 此外，训练期间输出为 1/(1-p) 。这意味着在评估期间，模块只需计算一个 identity 函数。
         self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # 2048 256
 
         self.norm1 = nn.LayerNorm(d_model)
+        # normalized_shape=256
         self.norm2 = nn.LayerNorm(d_model)
+        # normalized_shape=256
         self.dropout1 = nn.Dropout(dropout)
+        # dropout=0.1
         self.dropout2 = nn.Dropout(dropout)
+        # dropout=0.1
 
         self.activation = _get_activation_fn(activation)
-        self.normalize_before = normalize_before
+        # activation=relu
+        self.normalize_before = normalize_before 
+        # normalize_before=False 
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -184,7 +213,7 @@ class TransformerEncoderLayer(nn.Module):
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
         src = src + self.dropout2(src2)
         src = self.norm2(src)
-        return src
+        return src # 0.嵌位q,k 1.自注意力+AddDrop 2.前馈+AddDrop # 嵌位q,k 自注意力 AD.N 前馈 AD.N
 
     def forward_pre(self, src,
                     src_mask: Optional[Tensor] = None,
@@ -198,22 +227,21 @@ class TransformerEncoderLayer(nn.Module):
         src2 = self.norm2(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
         src = src + self.dropout2(src2)
-        return src
+        return src # 0.N.嵌入 1.自注意力 AD.N 2.前馈 AD
 
     def forward(self, src,
                 src_mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None):
         if self.normalize_before:
-            return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
-        return self.forward_post(src, src_mask, src_key_padding_mask, pos)
-
+            return self.forward_pre(src, src_mask, src_key_padding_mask, pos) # 归一化在在前的transformer层
+        return self.forward_post(src, src_mask, src_key_padding_mask, pos) # 归一化在在后的transformer层
 
 class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False):
-        super().__init__()
+        super().__init__() # transformer的基本思想就是在标准的FFNN前端加入注意力机制
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         # Implementation of Feedforward model
@@ -243,19 +271,19 @@ class TransformerDecoderLayer(nn.Module):
                      query_pos: Optional[Tensor] = None):
         q = k = self.with_pos_embed(tgt, query_pos)
         tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
+                              key_padding_mask=tgt_key_padding_mask)[0] # Attention(q=k=i+p,v=i)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+                                   key_padding_mask=memory_key_padding_mask)[0] # Attention(???,v=i) # queries
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
-        return tgt
+        return tgt # 0.嵌位q,k 1.注意力+AddDrop 2.注意力+AddDrop 3.前馈+AddDrop
 
     def forward_pre(self, tgt, memory,
                     tgt_mask: Optional[Tensor] = None,

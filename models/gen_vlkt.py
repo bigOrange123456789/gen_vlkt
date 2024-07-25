@@ -20,56 +20,103 @@ def _sigmoid(x):
     y = torch.clamp(x.sigmoid(), min=1e-4, max=1 - 1e-4)
     return y
 
+class DETR(nn.Module): # DETR这部分代码是从网上复制过来用来学习的，不参与程序的执行
+  # https://shihan-ma.github.io/posts/2021-04-15-DETR_annotation
+  def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
+    super().__init__()
+    self.num_queries = num_queries
+    self.transformer = transformer      # transformer 模型
+    hidden_dim = transformer.d_model    # 隐层维度，一般设为 256
+    self.class_embed = nn.Linear(hidden_dim, num_classes + 1)   # 全连接层，预测每类的概率
+    self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)         # 多层感知机，用于预测边界框位置
+    self.query_embed = nn.Embedding(num_queries, hidden_dim)    # 网络可学习的参数，含有物体抽象特征
+    self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)   # 1*1 卷积，用于特征降维
+    self.backbone = backbone  # 主干网络
+    self.aux_loss = aux_loss
+
+  def forward(self, samples: NestedTensor):
+    if isinstance(samples, (list, torch.Tensor)):
+        samples = nested_tensor_from_tensor_list(samples)   # 将 samples 包裹在 nested_tensor 中
+    features, pos = self.backbone(samples)
+    # mask 是所有图像 padding 后的维度（padding 到相同维度）
+    src, mask = features[-1].decompose()    # src [bs, dim, H, W], mask [bs, H, W]
+    assert mask is not None
+    hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]      
+    # transformer 返回 decoder 输出的 query embedding 以及 encoder 输出的 memory, 这里 [0] 表示取 query embedding
+
+    outputs_class = self.class_embed(hs)    # 将 transformer 输出结果转换为 类 的预测概率
+    outputs_coord = self.bbox_embed(hs).sigmoid()   # 将 transformer 输出结果转换为 框 的位置信息，sigmoid 归一化到 0-1
+    out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+    if self.aux_loss:
+        out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+    return out
 
 class GEN_VLKT(nn.Module):
     def __init__(self, backbone, transformer, num_queries, aux_loss=False, args=None):
+        # backbone=Joiner(...) 
+        # transformer=GEN(...) 
+        # num_queries=64 # ？
+        # aux_loss=True  # ？
+        # args=Namespace(lr=0.0001, ..)
         super().__init__()
 
-        self.args = args
-        self.num_queries = num_queries
+        self.args = args 
+        self.num_queries = num_queries # 64,字典中词的个数
         self.transformer = transformer
-        hidden_dim = transformer.d_model
-        self.query_embed_h = nn.Embedding(num_queries, hidden_dim)
+        hidden_dim = transformer.d_model #模型的嵌入隐维度
+        self.query_embed_h = nn.Embedding(num_queries, hidden_dim)#num_queries=64, hidden_dim=256
+        # nn.Embedding是PyTorch中的一个常用模块，其主要作用是将输入的整数序列转换为密集向量表示。
+        # 在自然语言处理（NLP）任务中，可以将每个单词表示成一个向量，从而方便进行下一步的计算和处理。
         self.query_embed_o = nn.Embedding(num_queries, hidden_dim)
         self.pos_guided_embedd = nn.Embedding(num_queries, hidden_dim)
-        self.hum_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.hum_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3) # in, hidden, out, num_layers
         self.obj_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
+        self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1) # 1*1 卷积，用于特征降维
+        # in_channels=2048 
+        # out_channels=256 
         self.backbone = backbone
         self.aux_loss = aux_loss
-        self.dec_layers = self.args.dec_layers
+        self.dec_layers = self.args.dec_layers # dec_layers=3 ?
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.obj_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        # torch.nn.Parameter()将一个不可训练的tensor转换成可以训练的类型parameter，并将这个parameter绑定到这个module里面。
+        # 即在定义网络时这个tensor就是一个可以训练的参数了。
+        # 使用这个函数的目的也是想让某些变量在学习的过程中不断的修改其值以达到最优化。
+        # 在训练网络的时候，可以使用nn.Parameter()来转换一个固定的权重数值，使其可以在反向传播时进行参数更新，从而学习到一个最适合的权重值。
 
         if self.args.dataset_file == 'hico':
             hoi_text_label = hico_text_label
             obj_text_label = hico_obj_text_label
             unseen_index = hico_unseen_index
         elif self.args.dataset_file == 'vcoco':
-            hoi_text_label = vcoco_hoi_text_label
-            obj_text_label = vcoco_obj_text_label
+            hoi_text_label = vcoco_hoi_text_label # hoi_text_label: {(0, 41): 'a photo of a person holding a cup', (16, 80): 'a photo of a person cutting with something', ... 
+            obj_text_label = vcoco_obj_text_label # obj_text_label: [(0, 'a photo of a person and a person'), (1, 'a photo of a person and a bicycle'), ...
             unseen_index = None
 
         clip_label, obj_clip_label, v_linear_proj_weight, hoi_text, obj_text, train_clip_label = \
-            self.init_classifier_with_CLIP(hoi_text_label, obj_text_label, unseen_index)
-        num_obj_classes = len(obj_text) - 1  # del nothing
+            self.init_classifier_with_CLIP(hoi_text_label, obj_text_label, unseen_index) # 获取文本的clip嵌入向量
+        num_obj_classes = len(obj_text) - 1  # del nothing # 最后一个标签是'图片里什么都没有' # 'a photo of nothing'
+        # obj_text_label: [(0, 'a photo of a person and a person'), (1, 'a photo of a person and a bicycle'), ...
+        # len(obj_text_label): 82
+        # len(obj_text): 82
+        # obj_text_label[81]: (81, 'a photo of nothing')
 
         self.hoi_class_fc = nn.Sequential(
             nn.Linear(hidden_dim, args.clip_embed_dim),
-            nn.LayerNorm(args.clip_embed_dim),
+            nn.LayerNorm(args.clip_embed_dim), # hidden=256 clip_embed=512
         )
 
-        if args.with_clip_label:
+        if args.with_clip_label: # with_clip_label=True
             self.visual_projection = nn.Linear(args.clip_embed_dim, len(hoi_text))
             self.visual_projection.weight.data = train_clip_label / train_clip_label.norm(dim=-1, keepdim=True)
-            if self.args.dataset_file == 'hico' and self.args.zero_shot_type != 'default':
+            if self.args.dataset_file == 'hico' and self.args.zero_shot_type != 'default': # dataset_file=vcoco zero_shot_type=default # False
                 self.eval_visual_projection = nn.Linear(args.clip_embed_dim, 600)
                 self.eval_visual_projection.weight.data = clip_label / clip_label.norm(dim=-1, keepdim=True)
         else:
             self.hoi_class_embedding = nn.Linear(args.clip_embed_dim, len(hoi_text))
 
-        if args.with_obj_clip_label:
+        if args.with_obj_clip_label: # with_clip_label: True
             self.obj_class_fc = nn.Sequential(
                 nn.Linear(hidden_dim, args.clip_embed_dim),
                 nn.LayerNorm(args.clip_embed_dim),
@@ -80,15 +127,24 @@ class GEN_VLKT(nn.Module):
             self.obj_class_embed = nn.Linear(hidden_dim, num_obj_classes + 1)
 
         self.hidden_dim = hidden_dim
-        self.reset_parameters()
+        self.reset_parameters() # 随机初始化参数值
 
     def reset_parameters(self):
         nn.init.uniform_(self.pos_guided_embedd.weight)
 
     def init_classifier_with_CLIP(self, hoi_text_label, obj_text_label, unseen_index):
+        # hoi_text_label: {(0, 41): 'a photo of a person holding a cup', (16, 80): 'a photo of a person cutting with something', ... 
+        # obj_text_label: [(0, 'a photo of a person and a person'), (1, 'a photo of a person and a bicycle'), ...
+        # unseen_index = None
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        text_inputs = torch.cat([clip.tokenize(hoi_text_label[id]) for id in hoi_text_label.keys()])
-        if self.args.del_unseen and unseen_index is not None:
+        text_inputs = torch.cat( # 将hoi_text_label里面的文本进行clip编码
+            [clip.tokenize(hoi_text_label[id]) for id in hoi_text_label.keys()])
+        # clip.tokenize('a photo of a person holding a cup'): tensor([[49406,   320,  1125, ...  
+        # torch.Size([1, 77])
+        # torch.cat : 把多个tensor进行拼接。
+        # hoi_text_label.keys() : [(0, 41), (16, 80), (17, 53), ...
+        # [x**2 for x in range(10)] => [0, 1, 4, 9, 16, 25, 36, 49, 64, 81]
+        if self.args.del_unseen and unseen_index is not None: # del_unseen=False unseen_index=None # False
             hoi_text_label_del = {}
             unseen_index_list = unseen_index.get(self.args.zero_shot_type, [])
             for idx, k in enumerate(hoi_text_label.keys()):
@@ -98,23 +154,29 @@ class GEN_VLKT(nn.Module):
                     hoi_text_label_del[k] = hoi_text_label[k]
         else:
             hoi_text_label_del = hoi_text_label.copy()
-        text_inputs_del = torch.cat(
+        text_inputs_del = torch.cat( # 【当前参数下】结果与text_inputs相同
             [clip.tokenize(hoi_text_label[id]) for id in hoi_text_label_del.keys()])
 
-        obj_text_inputs = torch.cat([clip.tokenize(obj_text[1]) for obj_text in obj_text_label])
-        clip_model, preprocess = clip.load(self.args.clip_model, device=device)
-        with torch.no_grad():
+        obj_text_inputs = torch.cat( # 将obj_text_label里面的文本进行clip编码
+            [clip.tokenize(obj_text[1]) for obj_text in obj_text_label])
+        clip_model, preprocess = clip.load(self.args.clip_model, device=device) # 加载clip的预训练模型
+        with torch.no_grad(): # Python 中的 with 语句用于异常判断
             text_embedding = clip_model.encode_text(text_inputs.to(device))
+            # text_inputs    = tensor([[494,    320,  11,    ... # torch.Size([263, 77])
+            # text_embedding = tensor([[-0.13,  0.51, -0.26, ... # torch.Size([263, 512])
             text_embedding_del = clip_model.encode_text(text_inputs_del.to(device))
             obj_text_embedding = clip_model.encode_text(obj_text_inputs.to(device))
+            # obj_text_inputs    = tensor([[49406,   320,  1125, ... # torch.Size([82, 77])
+            # obj_text_embedding = tensor([[ 0.11,  0.20, -0.29, ... # torch.Size([82, 512])
             v_linear_proj_weight = clip_model.visual.proj.detach()
+            # v_linear_proj_weight = tensor([[-2.62e-03,  5.09e-05,  2.74e-02, ... # torch.Size([768, 512])
 
-        del clip_model
+        del clip_model # 获得完编码向量后就可以删除clip模型了
 
         return text_embedding.float(), obj_text_embedding.float(), v_linear_proj_weight.float(), \
-               hoi_text_label_del, obj_text_inputs, text_embedding_del.float()
+               hoi_text_label_del, obj_text_inputs, text_embedding_del.float() #返回内容：【hoi嵌入 obj嵌入 权重 ; ? obj编码 ?】
 
-    def forward(self, samples: NestedTensor, is_training=True):
+    def forward(self, samples: NestedTensor, is_training=True): # 这个前向传播过程看起来似乎有点古怪
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
@@ -204,9 +266,16 @@ class MLP(nn.Module):
         return x
 
 
-class SetCriterionHOI(nn.Module):
+class SetCriterionHOI(nn.Module): #criterion标准 # 这个对象的作用应该是计算损失loss
 
     def __init__(self, num_obj_classes, num_queries, num_verb_classes, matcher, weight_dict, eos_coef, losses, args):
+        # num_obj_classes:81  # 对象种类数
+        # num_queries:64      # 查询目标数
+        # num_verb_classes:29 # 动词种类数
+        # matcher:HungarianMatcherHOI() # 匈牙利匹配算法
+        # weight_dict:{'loss_hoi_labels': 2, 'loss_obj_ce': 1, ... # 权重
+        # eos_coef:0.1 # eos的系数 # eos是什么？
+        # losses:['hoi_labels', 'obj_labels', 'sub_obj_boxes', 'feats_mimic'] #用到的损失函数
         super().__init__()
 
         self.num_obj_classes = num_obj_classes
@@ -216,12 +285,17 @@ class SetCriterionHOI(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
-        empty_weight = torch.ones(self.num_obj_classes + 1)
-        empty_weight[-1] = self.eos_coef
+        empty_weight = torch.ones(self.num_obj_classes + 1) # tensor([1., 1., 1., 1., ... 1.])
+        empty_weight[-1] = self.eos_coef                    # tensor([1., 1., 1., 1., ... 0.1])
         self.register_buffer('empty_weight', empty_weight)
+        # 这个tensor注册到模型的 buffers() 属性中，
+        # 并命名为'empty_weight',对应的是一个持久态，不会有梯度传播给它，但是能被模型的state_dict记录下来。
+        # 可以理解为模型的常数。
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.clip_model, _ = clip.load(args.clip_model, device=device)
-        self.alpha = args.alpha
+        self.clip_model, _ = clip.load(args.clip_model, device=device) 
+        # args.clip_model: ViT-B/32
+        # self.clip_model: CLIP(...)
+        self.alpha = args.alpha # alpha: 0.5
 
     def loss_obj_labels(self, outputs, targets, indices, num_interactions, log=True):
         assert 'pred_obj_logits' in outputs
@@ -415,11 +489,11 @@ class SetCriterionHOI(nn.Module):
         return losses
 
 
-class PostProcessHOITriplet(nn.Module):
+class PostProcessHOITriplet(nn.Module): # HOI三元组的后处理
 
     def __init__(self, args):
         super().__init__()
-        self.subject_category_id = args.subject_category_id
+        self.subject_category_id = args.subject_category_id # subject_category_id: 0
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
@@ -460,12 +534,14 @@ class PostProcessHOITriplet(nn.Module):
 
 
 def build(args):
-    device = torch.device(args.device)
+    device = torch.device(args.device)#[args.device: cuda , device: cuda]    
 
-    backbone = build_backbone(args)
+    print("1.build_backbone...")
+    backbone = build_backbone(args) # 这是一个添加了余弦嵌入的标准主干网，对应论文中的 CNN+PositionalEncoding
+    print("2.build_gen...")
+    gen = build_gen(args) # 对应论文中图1的内容
 
-    gen = build_gen(args)
-
+    print("3.GEN_VLKT...")
     model = GEN_VLKT(
         backbone,
         gen,
@@ -474,35 +550,44 @@ def build(args):
         args=args
     )
 
-    matcher = build_matcher(args)
+    print("4.build_matcher...")
+    matcher = build_matcher(args) #匈牙利匹配算法，使用DETR论文中的思想
+    print("5.SetCriterionHOI...")
     weight_dict = {}
-    if args.with_clip_label:
-        weight_dict['loss_hoi_labels'] = args.hoi_loss_coef
-        weight_dict['loss_obj_ce'] = args.obj_loss_coef
+    if args.with_clip_label: # with_clip_label: True #这个判断没有什么意义，因为后面的两段代码完全一致
+        weight_dict['loss_hoi_labels'] = args.hoi_loss_coef # hoi_loss_coef: 2
+        weight_dict['loss_obj_ce'] = args.obj_loss_coef     # obj_loss_coef: 1
     else:
         weight_dict['loss_hoi_labels'] = args.hoi_loss_coef
         weight_dict['loss_obj_ce'] = args.obj_loss_coef
 
-    weight_dict['loss_sub_bbox'] = args.bbox_loss_coef
+    weight_dict['loss_sub_bbox'] = args.bbox_loss_coef # bbox_loss_coef: 2.5
     weight_dict['loss_obj_bbox'] = args.bbox_loss_coef
-    weight_dict['loss_sub_giou'] = args.giou_loss_coef
+    weight_dict['loss_sub_giou'] = args.giou_loss_coef # giou_loss_coef: 1
     weight_dict['loss_obj_giou'] = args.giou_loss_coef
-    if args.with_mimic:
-        weight_dict['loss_feat_mimic'] = args.mimic_loss_coef
+    if args.with_mimic: # with_mimic: True
+        weight_dict['loss_feat_mimic'] = args.mimic_loss_coef # mimic_loss_coef: 20.0
 
-    if args.aux_loss:
+    if args.aux_loss: # aux_loss: True # aux是什么？
         aux_weight_dict = {}
-        for i in range(args.dec_layers - 1):
+        for i in range(args.dec_layers - 1): # dec_layers: 3
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
+            # weight_dict.items(): 
+            #                dict_items([('loss_hoi_labels', 2), ('loss_obj_ce', 1), ('loss_sub_bbox', 2.5), 
+            #                          ('loss_obj_bbox', 2.5), ('loss_sub_giou', 1), ('loss_obj_giou', 1), ('loss_feat_mimic', 20.0)])
+            # {k + f'_0': v for k, v in weight_dict.items()}: 
+            #               {'loss_hoi_labels_0': 2, 'loss_obj_ce_0': 1, 'loss_sub_bbox_0': 2.5, 
+            #                   'loss_obj_bbox_0': 2.5, 'loss_sub_giou_0': 1, 'loss_obj_giou_0': 1, 'loss_feat_mimic_0': 20.0}
         weight_dict.update(aux_weight_dict)
     losses = ['hoi_labels', 'obj_labels', 'sub_obj_boxes']
-    if args.with_mimic:
+    if args.with_mimic: # with_mimic: True
         losses.append('feats_mimic')
 
     criterion = SetCriterionHOI(args.num_obj_classes, args.num_queries, args.num_verb_classes, matcher=matcher,
                                 weight_dict=weight_dict, eos_coef=args.eos_coef, losses=losses,
                                 args=args)
     criterion.to(device)
+    print("6.PostProcessHOITriplet...")
     postprocessors = {'hoi': PostProcessHOITriplet(args)}
 
     return model, criterion, postprocessors

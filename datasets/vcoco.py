@@ -18,10 +18,22 @@ class VCOCO(torch.utils.data.Dataset):
         # self.ids = self.ids[:len]
 
     def __init__(self, img_set, img_folder, anno_file, transforms, num_queries, args):
+        # img_set:train 
+        # img_folder:data\v-coco\images\train2014 
+        # anno_file:data\v-coco\annotations\trainval_vcoco.json 
+        # transforms:[Compose(
+        #        <datasets.transforms.RandomHorizontalFlip object at 0x0000014D4F38BD50>
+        #        <datasets.transforms.ColorJitter object at 0x0000014D4F38BC50>
+        #        <datasets.transforms.RandomSelect object at 0x0000014D4F38BED0>
+        #    ), Compose(
+        #        <datasets.transforms.ToTensor object at 0x0000014D4DDDDE90>
+        #        <datasets.transforms.Normalize object at 0x0000014D4DBCD350>
+        #    )] 
+        # num_queries:64
         self.img_set = img_set
         self.img_folder = img_folder
-        with open(anno_file, 'r') as f:
-            self.annotations = json.load(f)
+        with open(anno_file, 'r') as f: # anno_file:...\trainval_vcoco.json 
+            self.annotations = json.load(f) # 读取标注文件
         self._transforms = transforms
 
         self.num_queries = num_queries
@@ -33,13 +45,20 @@ class VCOCO(torch.utils.data.Dataset):
                                48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
                                58, 59, 60, 61, 62, 63, 64, 65, 67, 70,
                                72, 73, 74, 75, 76, 77, 78, 79, 80, 81,
-                               82, 84, 85, 86, 87, 88, 89, 90)
-        self._valid_verb_ids = range(29)
+                               82, 84, 85, 86, 87, 88, 89, 90) # 对象种类标签为1-90
+        self._valid_verb_ids = range(29) # 交互种类标签为0-28
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        _, self.clip_preprocess = clip.load(args.clip_model, device)
+        _, self.clip_preprocess = clip.load(args.clip_model, device) # clip_model: ViT-B/32
+        # clip_preprocess: Compose(
+        #    Resize(size=224, interpolation=bicubic, max_size=None, antialias=True)
+        #    CenterCrop(size=(224, 224))
+        #    <function _convert_image_to_rgb at 0x000001C9DDB8C2C0>
+        #    ToTensor()
+        #    Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+        #)
 
-        self.text_label_ids = list(vcoco_hoi_text_label.keys())
+        self.text_label_ids = list(vcoco_hoi_text_label.keys()) # vcoco_text_label对象源自vcoco_text_label.py文件
 
     def __len__(self):
         return len(self.annotations)
@@ -203,19 +222,26 @@ def make_vcoco_transforms(image_set):
 
 
 def build(image_set, args):
-    root = Path(args.hoi_path)
+    root = Path(args.hoi_path) # hoi_path: data/v-coco # root: data\v-coco
     assert root.exists(), f'provided HOI path {root} does not exist'
     PATHS = {
-        'train': (root / 'images' / 'train2014', root / 'annotations' / 'trainval_vcoco.json'),
-        'val': (root / 'images' / 'val2014', root / 'annotations' / 'test_vcoco.json')
-    }
-    CORRECT_MAT_PATH = root / 'annotations' / 'corre_vcoco.npy'
+        'train': (root / 'images' / 'train2014', root / 'annotations' / 'trainval_vcoco.json'), # 训练集的标注 # 记录了物体框和交互关系
+        # 'train': (WindowsPath('data/v-coco/images/train2014'), WindowsPath('data/v-coco/annotations/trainval_vcoco.json'))
+        'val': (root / 'images' / 'val2014', root / 'annotations' / 'test_vcoco.json') # 测试集的标注
+        # 'val': (WindowsPath('data/v-coco/images/val2014'), WindowsPath('data/v-coco/annotations/test_vcoco.json'))
+    }    
+    CORRECT_MAT_PATH = root / 'annotations' / 'corre_vcoco.npy' # ？
+    # CORRECT_MAT_PATH = data\v-coco\annotations\corre_vcoco.npy
 
-    img_folder, anno_file = PATHS[image_set]
+    img_folder, anno_file = PATHS[image_set] 
+    # image_set: train
+    # img_folder: data\v-coco\images\train2014
+    # anno_file: data\v-coco\annotations\trainval_vcoco.json
     dataset = VCOCO(image_set, img_folder, anno_file, transforms=make_vcoco_transforms(image_set),
                     num_queries=args.num_queries, args=args)
-    if image_set == 'val':
-        dataset.load_correct_mat(CORRECT_MAT_PATH)
-
+    
+    if image_set == 'val': # 如果不是训练集而是验证集
+        dataset.load_correct_mat(CORRECT_MAT_PATH) # 加载corre_vcoco.npy
+    
     dataset.take_the_first(10)
     return dataset

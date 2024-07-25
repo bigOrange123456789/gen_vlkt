@@ -156,48 +156,54 @@ def get_args_parser():
 
 
 def main(args):
-    utils.init_distributed_mode(args)
-    print("git:\n  {}\n".format(utils.get_sha()))
+    utils.init_distributed_mode(args) #args: Namespace(lr=0.0001, lr_backbone=1e-05, ...)
+    print("git:\n  {}\n".format(utils.get_sha())) #应该是要判断是否为gitbub上的最新版
+    
+    if args.frozen_weights is not None: # False
+        assert args.masks, "Frozen training is meant for segmentation only" #冻结训练仅用于细分
+    #print(args)
 
-    if args.frozen_weights is not None:
-        assert args.masks, "Frozen training is meant for segmentation only"
-    print(args)
+    device = torch.device(args.device)#[args.device: cuda, device: cuda]
 
-    device = torch.device(args.device)
-
-    # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank()
+    # fix the seed for reproducibility # 固定种子以提高可重复性
+    seed = args.seed + utils.get_rank()#seed: 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+    print("开始构建模型...")
     model, criterion, postprocessors = build_model(args)
     model.to(device)
-    print('****************')
-    print(model)
-    print('****************')
+    print("完成构建模型...\n")
+    if False: # 这里可以输出模型的结构
+        print('****************')
+        print(model)
+        print('****************')
 
+    print("开始初始化optimizer...")
     model_without_ddp = model
-    if args.distributed:
+    if args.distributed: # distributed=False # 不进行分布式计算
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad) 
+    print('number of params:', n_parameters) # number of params: 41877603 # 参数总量:4千万
 
-    for name, p in model.named_parameters():
-        if 'eval_visual_projection' in name:
+    for name, p in model.named_parameters(): # 遍历模型的每一层
+        if 'eval_visual_projection' in name: # 似乎没有找到这样的层
             p.requires_grad = False
+            print("lzc flag: main.py: (1) if 'eval_visual_projection' in name")
 
-    if args.fix_clip:
+    if args.fix_clip: # fix_clip: False
         for name, p in model.named_parameters():
             if 'obj_visual_projection' in name or 'visual_projection' in name:
                 p.requires_grad = False
+                print("lzc flag: main.py: (2) if 'eval_visual_projection' in name")
 
-    if args.ft_clip_with_small_lr:
-        if args.with_obj_clip_label and args.with_clip_label:
-            param_dicts = [
+    if args.ft_clip_with_small_lr: #ft_clip_with_small_lr: True
+        if args.with_obj_clip_label and args.with_clip_label: # args.with_obj_clip_label=True  with_clip_label=True
+            param_dicts = [ # 感觉这里应该是获取了模型中全部参数
                 {"params": [p for n, p in model_without_ddp.named_parameters() if
                             "backbone" not in n and 'visual_projection' not in n and 'obj_visual_projection' not in n and p.requires_grad]},
                 {
@@ -253,27 +259,39 @@ def main(args):
             },
         ]
 
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, # lr=0.0001
+                                  weight_decay=args.weight_decay) # weight_decay=0.0001
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop) # args.lr_drop=60
+    # lr_scheduler: <StepLR> # 这对象是啥，有什么作用？
+    print("完成初始化optimizer...\n")
 
-    dataset_train = build_dataset(image_set='train', args=args)
-    dataset_val = build_dataset(image_set='val', args=args)
+    print("开始处理数据集...")
+    print("1.开始加载数据集标注...")
+    dataset_train = build_dataset(image_set='train', args=args) # dataset_train: <datasets.vcoco.VCOCO object>
+    dataset_val = build_dataset(image_set='val', args=args)     # dataset_val:   <datasets.vcoco.VCOCO object>
 
     if args.distributed:
         sampler_train = DistributedSampler(dataset_train)
         sampler_val = DistributedSampler(dataset_val, shuffle=False)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    else: #不使用分布式计算
+        sampler_train = torch.utils.data.RandomSampler(dataset_train) # 随机采样器
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val) # 序列采样器
 
-    batch_sampler_train = torch.utils.data.BatchSampler(
-        sampler_train, args.batch_size, drop_last=True)
+    batch_sampler_train = torch.utils.data.BatchSampler( # 批处理采样器
+        sampler_train, args.batch_size, drop_last=True) # batch_size=2
 
     data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
                                    collate_fn=utils.collate_fn, num_workers=args.num_workers)
-    data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
-                                 drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
+    # dataset_train: <datasets.vcoco.VCOCO object>
+    # utils.collate_fn: <function collate_fn>
+    # args.num_workers: 2
+    # data_loader_train: <torch.utils.data.dataloader.DataLoader>
+    data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val, drop_last=False,
+                                  collate_fn=utils.collate_fn, num_workers=args.num_workers)
+    # dataset_val: <datasets.vcoco.VCOCO>
+    # args.batch_size: 2
+    # sampler_val: <torch.utils.data.sampler.SequentialSampler>
+    exit(0)
 
     if args.frozen_weights is not None:
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')

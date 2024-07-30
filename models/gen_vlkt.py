@@ -456,27 +456,102 @@ class SetCriterionHOI(nn.Module): #criterion标准 # 这个对象的作用应该
         return loss_map[loss](outputs, targets, indices, num, **kwargs)
 
     def forward(self, outputs, targets):
-        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        # outputs:
+        # 64是num_queries,表示候选结果的数量
+        #   pred_hoi_logits  Size([2, 64, 263])  tensor([[[ 0.0458,  0.7638, -0.5954..)
+        #   pred_obj_logits  Size([2, 64, 82])
+        #   pred_sub_boxes   Size([2, 64, 4])
+        #   pred_obj_boxes   Size([2, 64, 4])
+        #   inter_memory     Size([2, 64, 512]) #inter_memory是啥?
+        #   aux_outputs <class 'list'> len=2
+        #       [0]：
+        #           pred_hoi_logits     Size([2, 64, 263])
+        #           pred_obj_logits     Size([2, 64, 82])
+        #           pred_sub_boxes      Size([2, 64, 4])
+        #           pred_obj_boxes      Size([2, 64, 4])
+        #           inter_memory        Size([2, 64, 512])
+        #       [1]:
+        #           pred_hoi_logits     Size([2, 64, 263])
+        #           pred_obj_logits     Size([2, 64, 82])
+        #           pred_sub_boxes      Size([2, 64, 4])
+        #           pred_obj_boxes      Size([2, 64, 4])
+        #           inter_memory        Size([2, 64, 512])
+        #       DETR作者发现在训练过程中在解码器中使用辅助损耗auxiliary losses很有帮助，特别是有助于模型输出正确数量的每个类的对象。
+        #       DETR在每个解码器层之后添加预测FFN和Hungarian loss，所有预测FFN共享其参数。 
+        #       DETR使用附加的共享层范数来标准化来自不同解码器层的预测FFN的输入。
+        #       首先，作为知识先验，我们要知道所谓多任务学习（Multi-Task Learning）就是通过在相关任务间共享表示信息，使得模型在原始任务上泛化性能更好。
+        #       也就是说，一旦发现我们的目标是优化多于一个的目标函数，就可以通过多任务学习来有效求解；
+        #       但即使对于优化目标只有一个的特殊的情况，辅助任务仍然有可能帮助我们改善主任务的学习性能。
 
-        # Retrieve the matching between the outputs of the last layer and the targets
+        # targets:
+        # [0]:
+        #          orig_size    Size([2])
+        #          size         Size([2])
+        #          boxes        Size([6, 4])
+        #          labels       Size([6])
+        #          iscrowd      Size([6])
+        #          area         Size([6])
+        #          clip_inputs  Size([3, 224, 224])
+        #          obj_labels   Size([3])
+        #          verb_labels  Size([3, 29])
+        #          hoi_labels   Size([3, 263])
+        #          sub_boxes    Size([3, 4])
+        #          obj_boxes    Size([3, 4])
+        # [1]:
+        #          orig_size    Size([2])
+        #          size         Size([2])
+        #          boxes        Size([6, 4])
+        #          labels       Size([6])
+        #          iscrowd      Size([6])
+        #          area         Size([6])
+        #          clip_inputs  Size([3, 224, 224])
+        #          obj_labels   Size([3])
+        #          verb_labels  Size([3, 29])
+        #          hoi_labels   Size([3, 263])
+        #          sub_boxes    Size([3, 4])
+        #          obj_boxes    Size([3, 4])
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'} # outputs对象，没有里面的aux
+
+        # Retrieve the matching between the outputs of the last layer and the targets # 减少所有GPU的损耗以用于日志记录
         indices = self.matcher(outputs_without_aux, targets)
+        # indices: [(
+        #       tensor([22, 42, 49]), 
+        #       tensor([1, 2, 0])), 
+        #       (tensor([ 0, 12, 49, 57]), 
+        #       tensor([3, 2, 0, 1])
+        #)]
 
         num_interactions = sum(len(t['hoi_labels']) for t in targets)
+        # num_interactions: 7
         num_interactions = torch.as_tensor([num_interactions], dtype=torch.float,
                                            device=next(iter(outputs.values())).device)
-        if is_dist_avail_and_initialized():
+        # num_interactions: tensor([7.], device='cuda:0')
+        if is_dist_avail_and_initialized(): # False # dist可以获取到并且能够初始化
             torch.distributed.all_reduce(num_interactions)
         num_interactions = torch.clamp(num_interactions / get_world_size(), min=1).item()
+        # num_interactions: 7.0
 
         # Compute all the requested losses
         losses = {}
-        for loss in self.losses:
+        for loss in self.losses: # self.losses: ['hoi_labels', 'obj_labels', 'sub_obj_boxes', 'feats_mimic']
             losses.update(self.get_loss(loss, outputs, targets, indices, num_interactions))
+        # losses: {
+        # 'loss_hoi_labels': tensor(225.4516, device='cuda:0', grad_fn=<RsubBackward1>), 
+        # 'hoi_class_error': tensor( 85.7143, device='cuda:0'), 
+        # 'loss_obj_ce':     tensor(  4.8103, device='cuda:0', grad_fn=<NllLoss2DBackward0>), 
+        # 'obj_class_error': tensor(    100., device='cuda:0'), 
+        # 'loss_sub_bbox':   tensor(  0.4883, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_obj_bbox':   tensor(  0.5961, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_sub_giou':   tensor(  0.5452, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_obj_giou':   tensor(  1.0786, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_feat_mimic': tensor(  0.8220, device='cuda:0', grad_fn=<MeanBackward0>)}
 
-        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
+        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer. # 在辅助损失的情况下，我们对每个中间层的输出重复这个过程。
         if 'aux_outputs' in outputs:
-            for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                indices = self.matcher(aux_outputs, targets)
+            for i, aux_outputs in enumerate(outputs['aux_outputs']): # 这个循环进行了2次，i=0,1
+                indices = self.matcher(aux_outputs, targets) # aux是数组中的元素、而target是数组 这样匹配合适吗？
+                # i=0,indices=[(tensor([35, 37, 49]), tensor([1, 2, 0])), (tensor([12, 17, 57, 62]), tensor([3, 2, 1, 0]))]
+                # i=1,indices=[(tensor([35, 37, 49]), tensor([2, 1, 0])), (tensor([ 0, 12, 49, 57]), tensor([3, 2, 0, 1]))]
                 for loss in self.losses:
                     kwargs = {}
                     if loss == 'obj_labels':
@@ -485,6 +560,33 @@ class SetCriterionHOI(nn.Module): #criterion标准 # 这个对象的作用应该
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_interactions, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+        # losses: {
+        # 'loss_hoi_labels': tensor(225.4516, device='cuda:0', grad_fn=<RsubBackward1>), 
+        # 'hoi_class_error': tensor(85.7143, device='cuda:0'), 
+        # 'loss_obj_ce': tensor(4.8103, device='cuda:0', grad_fn=<NllLoss2DBackward0>), 
+        # 'obj_class_error': tensor(100., device='cuda:0'), 
+        # 'loss_sub_bbox': tensor(0.4883, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_obj_bbox': tensor(0.5961, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_sub_giou': tensor(0.5452, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_obj_giou': tensor(1.0786, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_feat_mimic': tensor(0.8220, device='cuda:0', grad_fn=<MeanBackward0>), 
+
+        # 'loss_hoi_labels_0': tensor(198.1955, device='cuda:0', grad_fn=<RsubBackward1>), 
+        # 'hoi_class_error_0': tensor(100., device='cuda:0'), 
+        # 'loss_obj_ce_0': tensor(4.8462, device='cuda:0', grad_fn=<NllLoss2DBackward0>), 
+        # 'loss_sub_bbox_0': tensor(0.5139, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_obj_bbox_0': tensor(0.5457, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_sub_giou_0': tensor(0.5053, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_obj_giou_0': tensor(1.0609, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_feat_mimic_0': tensor(0.8143, device='cuda:0', grad_fn=<MeanBackward0>), 
+        # 'loss_hoi_labels_1': tensor(255.3134, device='cuda:0', grad_fn=<RsubBackward1>), 
+        # 'hoi_class_error_1': tensor(85.7143, device='cuda:0'), 
+        # 'loss_obj_ce_1': tensor(4.8006, device='cuda:0', grad_fn=<NllLoss2DBackward0>), 
+        # 'loss_sub_bbox_1': tensor(0.5094, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_obj_bbox_1': tensor(0.5345, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_sub_giou_1': tensor(0.6176, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_obj_giou_1': tensor(1.0357, device='cuda:0', grad_fn=<DivBackward0>), 
+        # 'loss_feat_mimic_1': tensor(0.8157, device='cuda:0', grad_fn=<MeanBackward0>)}
 
         return losses
 

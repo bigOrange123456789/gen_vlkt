@@ -265,8 +265,7 @@ def main(args):
     # lr_scheduler: <StepLR> # 这对象是啥，有什么作用？
     print("完成初始化optimizer...\n")
 
-    print("开始处理数据集...")
-    print("1.开始加载数据集标注...")
+    print("开始数据集处理...")
     dataset_train = build_dataset(image_set='train', args=args) # dataset_train: <datasets.vcoco.VCOCO object>
     dataset_val = build_dataset(image_set='val', args=args)     # dataset_val:   <datasets.vcoco.VCOCO object>
 
@@ -291,14 +290,18 @@ def main(args):
     # dataset_val: <datasets.vcoco.VCOCO>
     # args.batch_size: 2
     # sampler_val: <torch.utils.data.sampler.SequentialSampler>
-    exit(0)
+    print("完成数据集处理...\n")
 
-    if args.frozen_weights is not None:
+    print("开始加载预训练参数...")
+    if args.frozen_weights is not None: # frozen_weights: None
+        # frozen_weights，用于设置预训练模型的路径。这个参数的类型是字符串（str），默认值为None，表示不使用预训练模型。
+        # 如果设置了该参数的值，那么只有掩码头部（mask head）将被训练，其他部分将被冻结。
+        # 帮助信息解释了该参数的作用，即指定预训练模型的路径，以决定是否要进行模型微调。
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
-    output_dir = Path(args.output_dir)
-    if args.resume:
+    output_dir = Path(args.output_dir) # output_dir: exps\vcoco_gen_vlkt_s_r50_dec_3layers
+    if args.resume: # resume为空,这个判断为False
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
@@ -309,29 +312,37 @@ def main(args):
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
-    elif args.pretrained:
+    elif args.pretrained: # pretrained: params/detr-r50-pre-2branch-vcoco.pth
         checkpoint = torch.load(args.pretrained, map_location='cpu')
-        if args.eval:
-            model_without_ddp.load_state_dict(checkpoint['model'])
-        else:
-            model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        # torch.load_state_dict()函数就是用于将预训练的参数权重加载到新的模型之中。
+        if args.eval: # 不再继续训练模型
+            model_without_ddp.load_state_dict(checkpoint['model']) 
+            # 当strict=True,要求预训练权重层数的键值与新构建的模型中的权重层数名称完全吻合；
+            # 如果新构建的模型在层数上进行了部分微调，则上述代码就会报错：说key对应不上。
+        else: # 进行训练模型
+            model_without_ddp.load_state_dict(checkpoint['model'], strict=False) # load_state_dict：
+            # 此时，如果采用strict=False 不要求与旧模型完全一致。
+            # 也即，与训练权重中与新构建网络中匹配层的键值就进行使用，没有的就默认初始化。
 
-    if args.eval:
+    if args.eval: # eval: False
         test_stats = evaluate_hoi(args.dataset_file, model, postprocessors, data_loader_val,
                                   args.subject_category_id, device, args)
         return
+    print("完成加载预训练参数...\n")
 
     print("Start training")
     start_time = time.time()
     best_performance = 0
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
+    for epoch in range(args.start_epoch, args.epochs): # range(0,1)
+        if args.distributed: # args.distributed: False
             sampler_train.set_epoch(epoch)
 
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
-        lr_scheduler.step()
-        if epoch == args.epochs - 1:
+        lr_scheduler.step() # optimizer.step()应该在train()里面,而scheduler.step()是放在train()之后
+        # scheduler.step()的其中一个作用是调整学习率
+        
+        if epoch == args.epochs - 1: # epoch=0, args.epochs=1
             checkpoint_path = os.path.join(output_dir, 'checkpoint_last.pth')
             utils.save_on_master({
                 'model': model_without_ddp.state_dict(),
@@ -341,13 +352,20 @@ def main(args):
                 'args': args,
             }, checkpoint_path)
 
-        if epoch < args.lr_drop and epoch % 5 != 0:  ## eval every 5 epoch before lr_drop
+        if epoch < args.lr_drop and epoch % 5 != 0:  ## eval every 5 epoch before lr_drop # 在lr_drop之前每5个epoch进行一次eval
             continue
-        elif epoch >= args.lr_drop and epoch % 2 == 0:  ## eval every 2 epoch after lr_drop
+        elif epoch >= args.lr_drop and epoch % 2 == 0:  ## eval every 2 epoch after lr_drop # lr_drop后每2个epoch进行一次eval
             continue
 
-        test_stats = evaluate_hoi(args.dataset_file, model, postprocessors, data_loader_val,
+        test_stats = evaluate_hoi(args.dataset_file, model, postprocessors, data_loader_val, 
+                                  # dataset_file=vcoco
+                                  # postprocessors={'hoi': PostProcessHOITriplet()} 
+                                  # data_loader_val=<torch.utils.data.dataloader.DataLoader>
                                   args.subject_category_id, device, args)
+                                  # subject_category_id:0
+                                  # device:cuda
+        
+        # args.dataset_file: vcoco
         if args.dataset_file == 'hico':
             performance = test_stats['mAP']
         elif args.dataset_file == 'vcoco':
@@ -355,7 +373,7 @@ def main(args):
         elif args.dataset_file == 'hoia':
             performance = test_stats['mAP']
 
-        if performance > best_performance:
+        if performance > best_performance: # 0.009569377990430622 0 True
             checkpoint_path = os.path.join(output_dir, 'checkpoint_best.pth')
             utils.save_on_master({
                 'model': model_without_ddp.state_dict(),
@@ -372,13 +390,14 @@ def main(args):
                      'epoch': epoch,
                      'n_parameters': n_parameters}
 
+        # dataset_file: vcoco
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    print('Training time {}'.format(total_time_str)) # 输出训练时间
 
 
 if __name__ == '__main__':

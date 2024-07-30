@@ -22,6 +22,7 @@ class HICODetection(torch.utils.data.Dataset):
     def take_the_first(self, len):
         self.annotations = self.annotations[:len]
         self.ids = self.ids[:len]
+        print("HICODetection:","只保留前"+str(len)+"张图片")
 
     def __init__(self, img_set, img_folder, anno_file, clip_feats_folder, transforms, num_queries, args):
         self.img_set = img_set

@@ -16,6 +16,7 @@ class VCOCO(torch.utils.data.Dataset):
     def take_the_first(self, len):
         self.annotations = self.annotations[:len]
         # self.ids = self.ids[:len]
+        print("VCOCO:","只保留前"+str(len)+"张图片")
 
     def __init__(self, img_set, img_folder, anno_file, transforms, num_queries, args):
         # img_set:train 
@@ -243,5 +244,5 @@ def build(image_set, args):
     if image_set == 'val': # 如果不是训练集而是验证集
         dataset.load_correct_mat(CORRECT_MAT_PATH) # 加载corre_vcoco.npy
     
-    dataset.take_the_first(10)
+    dataset.take_the_first(5)
     return dataset
